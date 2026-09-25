@@ -99,6 +99,21 @@ RESULT: VULNERABLE — JSON Schema $ref is dereferenced by the Schema Registry
 The `file://` fetch reads a local file and the content is inlined into the normalized schema; the
 `http://` fetch reaches an attacker-chosen URL from the registry process.
 
+The fetched content is also **returned to the caller**, so this is a *reflected* (not blind) SSRF /
+file read. When the caller's existing version uses an `enum` and the malicious version places the
+`$ref` at that location, the compatibility check inlines the fetched document and echoes its values
+in the response `messages`:
+
+```text
+== Reflected exfiltration via the compatibility API response ==
+[exfil]  compatibility response messages: {'some of enum options are no longer valid CANARY_EXFIL_local_secret_value'}
+[exfil]  fetched content returned to caller via API response: True
+```
+
+That is, the content of a local file (or an internal HTTP response) is delivered verbatim in the body
+of `POST /compatibility/subjects/{subject}/versions/{version}` — an `is_compatible:false` response
+whose `messages` carry the stolen data straight back to the low-privileged caller.
+
 ## Impact
 Any user who can submit a JSON Schema to a compatibility check or registration makes the Schema
 Registry host perform attacker-directed requests:
@@ -107,11 +122,14 @@ Registry host perform attacker-directed requests:
   response is a path to host-credential theft and lateral movement into the orchestration plane.
 - **Arbitrary local file read** via `file://` (Kafka/TLS credential files, config with secrets, etc.).
 
-The fetched response is inlined into the internal normalized schema. The current endpoints do not
-return that normalized form verbatim, so direct full-response read-back is not exposed; recovery of
-the response is via the compatibility verdict/messages as an oracle, error text, and request timing.
-The outbound request itself (the SSRF, and the local file read) is unconditional and is the primary
-impact. Reachable by a low-privilege user (`Read` on one subject); no admin role required.
+This is a **reflected** SSRF / file read, not blind: as shown above, the fetched document's content
+is returned to the caller in the compatibility response `messages` (via the `enum` comparison path),
+so an internal HTTP response or a local JSON file is exfiltrated directly through the API. The
+outbound request / file read itself is unconditional. Reachable by a low-privilege user (`Read` on one
+subject; free trial accounts suffice); no admin role required. Local file read via `file://` is
+independent of any network egress policy, so credential/config files that happen to be JSON (service
+account keys, container/registry configs, mounted secrets) are readable even where outbound SSRF is
+filtered.
 
 ## Remediation
 Do not dereference external `$ref` schemes on untrusted schemas. Concretely:
@@ -137,15 +155,47 @@ compatibility/normalization code (the PoC stubs the native protopace/otel module
 then run:
 
 ```bash
-pip install jsonschema avro pydantic pydantic-settings typing_extensions
+pip install jsonschema avro pydantic pydantic-settings typing_extensions networkx
 
-# Drives the real parse_jsonschema_definition + normalize_schema; RESULT: VULNERABLE (exit 1)
+# Drives the real parse_jsonschema_definition + normalize_schema (+ compatibility() for the
+# reflected-exfiltration demo); RESULT: VULNERABLE (exit 1) on b960b4b, SAFE (exit 0) once fixed.
 PYTHONPATH=src python3 poc/karapace_jsonschema_ssrf_poc.py
 ```
 
 Note for the Aiven bug bounty: the code-level PoC above proves the primitive; the program requires a
 proof of concept on the Aiven resource. Validate by creating an Aiven for Apache Kafka service with
-Karapace schema registry, registering a first schema version to your own subject, then submitting a
-JSON Schema whose `$ref` targets an internal host / `169.254.169.254`, and observing the outbound
-request (e.g. via a collaborator host you control that the registry can reach, or via the metadata
-service response surfacing through the compatibility oracle).
+Karapace schema registry, registering a first (benign) schema version whose `x` property is an `enum`
+to your own subject, then submitting to `POST /compatibility/subjects/<subject>/versions/1` a JSON
+Schema that replaces `x` with `{"$ref":"http://169.254.169.254/…"}` (or `file:///…`) and reading the
+fetched content back out of the `messages` in the response body.
+
+## Anticipated triager objections and rebuttals
+- **"Theoretical / no PoC on an Aiven asset."** The PoC drives the exact functions on Aiven's own
+  code and reflects fetched content back to the caller. Per the *Aiven Open Source Repositories*
+  scope, a vulnerability in Aiven open-source code is in scope; the code is present verbatim in
+  upstream `Aiven-Open/karapace` at HEAD `b960b4b` (see `poc_output_UPSTREAM_vulnerable.txt`). To also
+  claim the managed-service tier, run the same request against an Aiven for Apache Kafka schema
+  registry (steps above).
+- **"It's a `jsonschema` (third-party) bug."** No — the flaw is Karapace's code deliberately calling
+  `resolver.resolve()` on an attacker-controlled `$ref` during normalization, and explicitly using the
+  deprecated `validator.resolver` (with a standing TODO). SSRF via passing untrusted input to a
+  fetching sink is attributed to the application, not the library, exactly as XXE is attributed to the
+  app, not the XML parser.
+- **"Blind SSRF / low impact."** Not blind: the fetched document's content is returned in the
+  compatibility response `messages` (demonstrated above), so internal HTTP responses and local JSON
+  files are exfiltrated directly.
+- **"Needs a special/non-default configuration."** No — default compatibility is `BACKWARD`
+  (`config.py:101`), and the compatibility check normalizes the submitted (attacker) schema on any
+  subject that has ≥1 version. The attacker creates their own subject and registers one benign version
+  first; only `Read` on that subject is needed for the compatibility endpoint.
+- **"Only affects old Draft-7."** The same normalization/resolver path runs for Draft 2019-09 and
+  2020-12 (`$schema` selected by the submitter); the resolver is legacy in every case.
+- **"Parsing rejects external `$ref`."** It does not: `parse_jsonschema_definition` only runs
+  `check_schema` (meta-schema validation), which accepts `"$ref":"http://…"`/`"file://…"` — verified
+  by the PoC parsing it successfully.
+- **"Metadata uses IMDSv2 / egress is filtered."** The `file://` local file read needs no network and
+  is unaffected by egress policy; the SSRF additionally reaches internal services beyond the metadata
+  endpoint. Impact does not rest on IMDSv1.
+- **"Already reported / fixed."** No mitigation exists in upstream (`resolve_remote` is never
+  restricted; no `$ref`-scheme check anywhere), so it is not fixed in code. (The reporter should still
+  confirm no prior Bugcrowd submission / GHSA covers it.)
