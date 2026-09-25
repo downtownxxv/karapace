@@ -16,8 +16,10 @@ from karapace.core.auth import (
     ACLAuthorizer,
     ACLEntry,
     AuthenticationError,
+    DEFAULT_PBKDF2_ITERATIONS,
     HashAlgorithm,
     HTTPAuthorizer,
+    LEGACY_PBKDF2_ITERATIONS,
     NoAuthAndAuthz,
     Operation,
     User,
@@ -272,6 +274,50 @@ def test_acl_authorizer() -> None:
     )
 
 
+def test_acl_resource_pattern_is_fully_anchored() -> None:
+    """A resource pattern must match the whole resource string, not just a prefix.
+
+    Regression test for an authorization over-grant: with an unanchored ``re.match``,
+    a permission for ``Subject:orders`` also matched ``Subject:orders-secret`` (and any
+    other resource sharing that prefix), silently widening access. Patterns must be
+    fully anchored so a literal grant is exact and wildcards must be explicit.
+    """
+    authorizer = ACLAuthorizer(
+        user_db={},
+        permissions=[ACLEntry("alice", Operation.Read, re.compile(r"Subject:orders"))],
+    )
+    alice = User(username="alice", algorithm=HashAlgorithm.SHA256, salt="s", password_hash="h")
+
+    # The exact, intended resource is still authorized.
+    assert authorizer.check_authorization(user=alice, operation=Operation.Read, resource="Subject:orders") is True
+
+    # Resources that merely share the prefix must NOT be authorized.
+    for leaked in ("Subject:orders-secret", "Subject:ordersX", "Subject:orders.internal"):
+        assert authorizer.check_authorization(user=alice, operation=Operation.Read, resource=leaked) is False, (
+            f"{leaked!r} must not be authorized by the pattern 'Subject:orders'"
+        )
+    assert (
+        authorizer.check_authorization_any(
+            user=alice, operation=Operation.Read, resources=["Subject:orders-secret", "Subject:ordersX"]
+        )
+        is False
+    )
+
+
+def test_acl_wildcard_pattern_still_matches_suffixes() -> None:
+    """Explicit ``.*`` wildcards keep matching suffixes after the anchoring fix."""
+    authorizer = ACLAuthorizer(
+        user_db={},
+        permissions=[ACLEntry("bob", Operation.Read, re.compile(r"Subject:cave-.*"))],
+    )
+    bob = User(username="bob", algorithm=HashAlgorithm.SHA256, salt="s", password_hash="h")
+
+    assert authorizer.check_authorization(user=bob, operation=Operation.Read, resource="Subject:cave-1") is True
+    assert authorizer.check_authorization(user=bob, operation=Operation.Read, resource="Subject:cave-anything") is True
+    # A different prefix is denied.
+    assert authorizer.check_authorization(user=bob, operation=Operation.Read, resource="Subject:carpet-1") is False
+
+
 def test_get_user_returns_none_for_nonexistent_user() -> None:
     """get_user must return None (not raise) for unknown usernames.
 
@@ -309,7 +355,15 @@ def test_authenticate_raises_authentication_error_for_wrong_password(tmp_path) -
     admin_password_hash = hash_password(algorithm=HashAlgorithm.SHA256, salt="salt", plaintext_password="password")
     auth_file = _make_authfile(
         tmp_path,
-        users=[{"username": "admin", "algorithm": "sha256", "salt": "salt", "password_hash": admin_password_hash}],
+        users=[
+            {
+                "username": "admin",
+                "algorithm": "sha256",
+                "salt": "salt",
+                "password_hash": admin_password_hash,
+                "iterations": DEFAULT_PBKDF2_ITERATIONS,
+            }
+        ],
     )
     http_authorizer = HTTPAuthorizer(auth_file)
     http_authorizer._load_authfile()
@@ -327,6 +381,62 @@ class TestHashPassword:
     def test_unsupported_algorithm_raises_not_implemented(self) -> None:
         with pytest.raises(NotImplementedError, match="not implemented"):
             hash_password(None, salt="salt", plaintext_password="password")  # type: ignore[arg-type]
+
+    def test_default_iteration_count_is_strong(self) -> None:
+        """The default PBKDF2 work factor must be well above the weak legacy count."""
+        assert LEGACY_PBKDF2_ITERATIONS == 5000
+        assert DEFAULT_PBKDF2_ITERATIONS >= 210_000
+        assert DEFAULT_PBKDF2_ITERATIONS > LEGACY_PBKDF2_ITERATIONS
+
+    def test_iteration_count_changes_pbkdf2_output(self) -> None:
+        """Different iteration counts must yield different hashes for the same input."""
+        legacy = hash_password(HashAlgorithm.SHA256, salt="s", plaintext_password="p", iterations=LEGACY_PBKDF2_ITERATIONS)
+        strong = hash_password(HashAlgorithm.SHA256, salt="s", plaintext_password="p", iterations=DEFAULT_PBKDF2_ITERATIONS)
+        assert legacy != strong
+
+    def test_scrypt_ignores_iteration_count(self) -> None:
+        """scrypt carries its own cost parameters; the iterations argument is a no-op."""
+        a = hash_password(HashAlgorithm.SCRYPT, salt="s", plaintext_password="p", iterations=LEGACY_PBKDF2_ITERATIONS)
+        b = hash_password(HashAlgorithm.SCRYPT, salt="s", plaintext_password="p", iterations=DEFAULT_PBKDF2_ITERATIONS)
+        assert a == b
+
+
+class TestComparePasswordIterations:
+    """compare_password must use the iteration count the hash was generated with."""
+
+    def test_legacy_hash_without_iterations_field_still_verifies(self) -> None:
+        # A hash generated with the old fixed count, stored WITHOUT an iterations field
+        # (as pre-existing authfiles are), must still verify: iterations=None -> legacy count.
+        legacy_hash = hash_password(
+            HashAlgorithm.SHA512, salt="salt", plaintext_password="opensesame", iterations=LEGACY_PBKDF2_ITERATIONS
+        )
+        user = User(username="u", algorithm=HashAlgorithm.SHA512, salt="salt", password_hash=legacy_hash, iterations=None)
+        assert user.compare_password("opensesame") is True
+        assert user.compare_password("wrong") is False
+
+    def test_hash_with_explicit_iterations_roundtrips(self) -> None:
+        strong_hash = hash_password(
+            HashAlgorithm.SHA256, salt="salt", plaintext_password="hunter2", iterations=DEFAULT_PBKDF2_ITERATIONS
+        )
+        user = User(
+            username="u",
+            algorithm=HashAlgorithm.SHA256,
+            salt="salt",
+            password_hash=strong_hash,
+            iterations=DEFAULT_PBKDF2_ITERATIONS,
+        )
+        assert user.compare_password("hunter2") is True
+
+    def test_wrong_stored_iteration_count_fails_verification(self) -> None:
+        # Sanity check that the count is actually part of verification: a strong-count hash
+        # verified as if it were a legacy hash (iterations=None) must fail.
+        strong_hash = hash_password(
+            HashAlgorithm.SHA256, salt="salt", plaintext_password="hunter2", iterations=DEFAULT_PBKDF2_ITERATIONS
+        )
+        mislabeled = User(
+            username="u", algorithm=HashAlgorithm.SHA256, salt="salt", password_hash=strong_hash, iterations=None
+        )
+        assert mislabeled.compare_password("hunter2") is False
 
 
 class TestNoAuthAndAuthz:
@@ -412,7 +522,15 @@ class TestLoadAuthfile:
         password_hash = hash_password(HashAlgorithm.SHA256, salt="s", plaintext_password="secret")
         auth_file = _make_authfile(
             tmp_path,
-            users=[{"username": "admin", "algorithm": "sha256", "salt": "s", "password_hash": password_hash}],
+            users=[
+                {
+                    "username": "admin",
+                    "algorithm": "sha256",
+                    "salt": "s",
+                    "password_hash": password_hash,
+                    "iterations": DEFAULT_PBKDF2_ITERATIONS,
+                }
+            ],
         )
         authorizer = HTTPAuthorizer(auth_file)
         authorizer._load_authfile()
@@ -569,6 +687,27 @@ class TestMain:
         assert parsed["algorithm"] == "sha256"
         assert parsed["salt"] == "my-salt"
         assert parsed["password_hash"] == hash_password(HashAlgorithm.SHA256, "my-salt", "my-password")
+        # PBKDF2 output is self-describing: the iteration count is emitted so it round-trips.
+        assert parsed["iterations"] == DEFAULT_PBKDF2_ITERATIONS
+
+    def test_custom_iterations_are_honored_and_emitted(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(sys, "argv", ["karapace_mkpasswd", "-a", "sha256", "-i", "300000", "my-password", "my-salt"])
+
+        exit_code = main()
+
+        assert exit_code == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert parsed["iterations"] == 300000
+        assert parsed["password_hash"] == hash_password(HashAlgorithm.SHA256, "my-salt", "my-password", iterations=300000)
+
+    def test_scrypt_output_omits_iterations(self, monkeypatch, capsys) -> None:
+        monkeypatch.setattr(sys, "argv", ["karapace_mkpasswd", "-a", "scrypt", "my-password", "my-salt"])
+
+        exit_code = main()
+
+        assert exit_code == 0
+        parsed = json.loads(capsys.readouterr().out)
+        assert "iterations" not in parsed
 
     def test_omits_username_and_generates_salt_when_not_provided(self, monkeypatch, capsys) -> None:
         monkeypatch.setattr(sys, "argv", ["karapace_mkpasswd", "my-password"])
