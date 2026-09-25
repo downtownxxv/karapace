@@ -5,6 +5,7 @@ See LICENSE for details
 
 from copy import copy
 from karapace.core.compatibility.jsonschema.types import BooleanSchema, Instance, Keyword, Subschema
+from karapace.core.errors import InvalidSchema
 from karapace.core.typing import JsonSchemaValidator
 from typing import Any, TypeVar, Union
 
@@ -60,19 +61,38 @@ def normalize_schema(validator: JsonSchemaValidator) -> Any:
     return normalize_schema_rec(validator, original_schema)
 
 
+def _refuse_remote_resolution(uri: str) -> Any:
+    # Never fetch an external JSON Schema reference. The legacy resolver would otherwise
+    # dereference attacker-controlled ``$ref``/``$id`` targets by fetching them: ``http(s)://``
+    # is an outbound request from the registry host (SSRF, incl. cloud metadata) and ``file://``
+    # reads a local file. Only same-document references (served from the resolver's in-memory
+    # store) are legitimate here; anything that requires an outbound fetch is rejected.
+    raise InvalidSchema(f"Refusing to dereference external JSON Schema reference: {uri!r}")
+
+
 def _resolver_of(validator: JsonSchemaValidator) -> Any:
-    """Return the validator's ref resolver.
+    """Return the validator's ref resolver, hardened against remote/file dereferencing.
 
     ``Validator.resolver`` is deprecated as of jsonschema 4.18 in favour of the ``referencing``
     library, but ``normalize_schema`` still relies on its ``push_scope``/``pop_scope``/``resolve``
     API. The pin ``jsonschema>=4.18,<5`` guarantees the attribute stays available (deprecations are
     not removed within a major series), so we access it in one place and silence the warning here.
 
-    TODO: migrate reference resolution to the ``referencing`` library and drop this shim.
+    We also disable the resolver's remote resolution: ``resolve()`` serves in-document references
+    from its store and only calls ``resolve_remote`` when it would have to fetch another document,
+    so replacing that method closes the SSRF / local-file-read vector without affecting valid
+    ``#/...`` references.
+
+    TODO: migrate reference resolution to the ``referencing`` library (whose default performs no
+    retrieval) and drop this shim.
     """
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
-        return validator.resolver
+        resolver = validator.resolver
+    if not getattr(resolver, "_karapace_no_remote_resolution", False):
+        resolver.resolve_remote = _refuse_remote_resolution  # type: ignore[method-assign]
+        resolver._karapace_no_remote_resolution = True  # type: ignore[attr-defined]
+    return resolver
 
 
 def normalize_schema_rec(validator: JsonSchemaValidator, original_schema: Any) -> Any:

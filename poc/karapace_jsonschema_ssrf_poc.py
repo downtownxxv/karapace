@@ -79,10 +79,15 @@ def demo_local_file_read() -> bool:
     try:
         schema = json.dumps({"type": "object", "properties": {"x": {"$ref": f"file://{secret_path}"}}})
         validator = parse_jsonschema_definition(schema)
-        normalized = json.dumps(normalize_schema(validator))
-        leaked = canary in normalized
         print("[file://] attacker schema $ref -> ", f"file://{secret_path}")
-        print("[file://] normalized schema     -> ", normalized)
+        try:
+            normalized = json.dumps(normalize_schema(validator))
+        except Exception as exc:  # fixed build refuses the external ref before reading the file
+            normalized = ""
+            print("[file://] refused by registry:", type(exc).__name__, "-", exc)
+        leaked = canary in normalized
+        if normalized:
+            print("[file://] normalized schema     -> ", normalized)
         print(f"[file://] local file content read: {leaked}")
         return leaked
     finally:
@@ -112,8 +117,11 @@ def demo_ssrf() -> bool:
         ref = f"http://127.0.0.1:{port}/latest/meta-data/iam/security-credentials/"
         schema = json.dumps({"type": "object", "properties": {"x": {"$ref": ref}}})
         validator = parse_jsonschema_definition(schema)
-        normalize_schema(validator)
         print("[http://] attacker schema $ref -> ", ref)
+        try:
+            normalize_schema(validator)
+        except Exception as exc:  # fixed build refuses the external ref before the request
+            print("[http://] refused by registry:", type(exc).__name__, "-", exc)
         print("[http://] requests received by the internal service:", hits)
         return len(hits) > 0
     finally:

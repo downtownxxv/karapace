@@ -122,6 +122,15 @@ Do not dereference external `$ref` schemes on untrusted schemas. Concretely:
   resolver with a `handlers` map / `resolve_remote=False`-equivalent that refuses remote resolution.
 - Reject non-local `$ref` at parse time in `parse_jsonschema_definition` as defense in depth.
 
+A fix is implemented in commit history on branch `claude/tender-heisenberg-cooy3y`: `_resolver_of`
+(`compatibility/jsonschema/utils.py`) now replaces the resolver's `resolve_remote` with a function
+that raises, so `resolve()` still serves in-document (`#/…`) references from its store but any
+attempt to fetch an external document (`http(s)://`, `file://`, or a nested external `$id` scope) is
+refused. Regression tests (`tests/unit/compatibility/jsonschema/test_ref_ssrf.py`) assert that a
+`file://` ref is not read, an `http://` ref triggers no outbound request, and in-document refs still
+normalize; `poc/karapace_jsonschema_ssrf_poc.py` reports `SAFE` against the fixed code and
+`VULNERABLE` against `b960b4b`.
+
 ## Reproduce
 Linux, Python 3.11+, a Karapace checkout. Install the pure-Python deps needed to import the
 compatibility/normalization code (the PoC stubs the native protopace/otel modules it does not use),
